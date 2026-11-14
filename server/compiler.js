@@ -534,6 +534,92 @@ function runProcess({ bin, args, prompt, cwd, emit, useShell = false, timeoutMs 
   });
 }
 
+function extractGrokStreamText(raw) {
+  const parts = [];
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('{')) continue;
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (event.type === 'text' && typeof event.data === 'string') parts.push(event.data);
+  }
+  return parts.join('');
+}
+
+function runGrokHeadless({ bin, args, cwd, emit, env, timeoutMs = 180000 }) {
+  cancelActiveBuild();
+  return new Promise((resolve, reject) => {
+    emit('terminal', { stream: 'system', text: `$ ${path.basename(bin)} ${args.join(' ')}\r\n` });
+    const proc = spawn(bin, args, { cwd, windowsHide: true, env: env || process.env });
+    activeBuildProc = proc;
+    let stdout = '';
+    let stderr = '';
+    let pending = '';
+    let thoughtNoted = false;
+    let timer = null;
+
+    const resetTimer = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        killProcTree(proc);
+        reject(new Error(`Grok stopped sending output for ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
+    };
+    resetTimer();
+
+    const takeLines = (chunk) => {
+      pending += chunk.toString();
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('{')) continue;
+        let event;
+        try {
+          event = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+        if (event.type === 'text' && typeof event.data === 'string') {
+          emit('terminal', { stream: 'stdout', text: event.data });
+        } else if (event.type === 'thought' && !thoughtNoted) {
+          thoughtNoted = true;
+          emit('terminal', { stream: 'system', text: '[grok] thinking...\r\n' });
+        }
+      }
+    };
+
+    proc.stdout.on('data', (chunk) => {
+      resetTimer();
+      stdout += chunk.toString();
+      takeLines(chunk);
+    });
+    proc.stderr.on('data', (chunk) => {
+      resetTimer();
+      const text = chunk.toString();
+      stderr += text;
+      emit('terminal', { stream: 'stderr', text });
+    });
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      if (activeBuildProc === proc) activeBuildProc = null;
+      reject(err);
+    });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (activeBuildProc === proc) activeBuildProc = null;
+      if (code !== 0 && !stdout.trim()) {
+        return reject(new Error(stderr.trim() || `Grok exited with code ${code}`));
+      }
+      resolve({ stdout, stderr, code, text: extractGrokStreamText(stdout) });
+    });
+  });
+}
+
 function parseGeneratedOutput(rawOutput, target) {
   const files = {};
 
@@ -947,7 +1033,7 @@ STRICT RULES (FOLLOW EXACTLY):
     try {
       let result;
       try {
-        result = await runProcess({
+        result = await runGrokHeadless({
           bin: resolveGrokBinary(),
           args: [
             '--no-auto-update',
@@ -955,8 +1041,9 @@ STRICT RULES (FOLLOW EXACTLY):
             '--verbatim',
             '--disable-web-search',
             '--max-turns', '1',
+            '--reasoning-effort', 'low',
             '-m', model,
-            '--output-format', 'plain',
+            '--output-format', 'streaming-json',
             '--prompt-file', promptFile
           ],
           cwd: projDir,
@@ -969,7 +1056,7 @@ STRICT RULES (FOLLOW EXACTLY):
         }
         throw err;
       }
-      const files = parseGeneratedOutput(result.stdout, target);
+      const files = parseGeneratedOutput(result.text || result.stdout, target);
       if (!files) throw new Error('Grok did not return valid file blocks.');
       if (files['index.html']) files[buildHtmlName] = files['index.html'];
       return writeFilesToWorkspace(projDir, files);
